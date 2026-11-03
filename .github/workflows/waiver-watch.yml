@@ -1,8 +1,15 @@
 # Put this file at .github/workflows/waiver-watch.yml in your repo.
 #
-# Start it from GitHub: Actions tab -> "Waiver watch" -> "Run workflow",
-# enter a player name (or ID), and press the green button. It waits until
-# 3:00 AM ET, polls every 30s until 5:00 AM ET, then stops.
+# Two ways it runs:
+#
+# 1. Manually, when you want a specific player: Actions tab -> "Waiver watch" ->
+#    "Run workflow", enter a player name (or ID). It waits until 3:00 AM ET,
+#    polls every 30s until 5:00 AM ET, and pushes to your phone when he clears.
+#
+# 2. Automatically every night, just to collect processing times: it picks any
+#    player due to clear that night, logs when waivers ran to data/waiver_log.csv,
+#    and sends no phone push. If nobody clears that night, it exits in seconds.
+#    To pause it: Actions tab -> "Waiver watch" -> "..." -> "Disable workflow".
 #
 # Repo secrets it uses (Settings -> Secrets and variables -> Actions):
 #   ESPN_LEAGUE_ID  (required)
@@ -28,42 +35,85 @@ on:
         type: boolean
         default: false
 
-# Only one watch at a time: starting a new run cancels an older one still waiting.
+  # GitHub schedules are in UTC and can start late (often 5-30 min, occasionally more).
+  # 06:41 and 07:41 UTC are 1:41/2:41 AM ET in winter and 2:41/3:41 AM ET in summer;
+  # the "Check the time" step only lets through the run that lands near 3 AM ET,
+  # so it works on both sides of daylight saving. The odd minute avoids the
+  # top-of-hour rush, when GitHub delays or drops scheduled runs most.
+  schedule:
+    - cron: "41 6 * * *"
+    - cron: "41 7 * * *"
+
+# One watch at a time. A manual run cancels anything in progress (including a
+# nightly tracking run); a nightly run queues behind a manual one instead, then
+# exits right away because the manual run already logged that night.
 concurrency:
   group: waiver-watch
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
+
+# Lets the run commit the processing-time log (data/waiver_log.csv) back to the repo.
+permissions:
+  contents: write
 
 jobs:
   watch:
     runs-on: ubuntu-latest
-    # GitHub's hard limit is 6 hours (360 min). Start the run after ~11 PM ET
+    # GitHub's hard limit is 6 hours (360 min). Start manual runs after ~11 PM ET
     # so the whole 3-5 AM window fits.
     timeout-minutes: 360
 
     steps:
+      # Nightly runs only: skip the duplicate run (see schedule above) without
+      # spending time on setup. Lets through anything from 2:00 to 4:30 AM ET.
+      - name: Check the time
+        id: gate
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "go=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          now=$(TZ=America/New_York date +%H%M)
+          echo "It's $now ET."
+          if (( 10#$now >= 200 && 10#$now < 430 )); then
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Not the right run for tonight - skipping."
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Get the code
+        if: steps.gate.outputs.go == 'true'
         uses: actions/checkout@v4
 
       - name: Set up Python
+        if: steps.gate.outputs.go == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Install dependencies
+        if: steps.gate.outputs.go == 'true'
         run: pip install -r requirements.txt
 
       - name: Watch waivers
+        if: steps.gate.outputs.go == 'true'
+        # Stop a little before the job's 6-hour limit so the log still gets saved.
+        timeout-minutes: 350
         env:
           ESPN_LEAGUE_ID: ${{ secrets.ESPN_LEAGUE_ID }}
           ESPN_S2: ${{ secrets.ESPN_S2 }}
           ESPN_SWID: ${{ secrets.ESPN_SWID }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          EVENT: ${{ github.event_name }}
           # Inputs go through env vars, not straight into the script line,
           # so odd characters in a name can't break the command.
           INPUT_NAME: ${{ inputs.name }}
           INPUT_PLAYER: ${{ inputs.player }}
           INPUT_NOW: ${{ inputs.now }}
         run: |
+          if [ "$EVENT" = "schedule" ]; then
+            python3 waiver_watch.py --auto --skip-if-logged
+            exit
+          fi
           args=(--one-window)
           if [ -n "$INPUT_NAME" ]; then
             args+=(--name "$INPUT_NAME")
@@ -78,16 +128,40 @@ jobs:
           fi
           python3 waiver_watch.py "${args[@]}"
 
+      - name: Save processing-time log
+        if: always() && steps.gate.outputs.go == 'true'
+        run: |
+          if [ -z "$(git status --porcelain data/)" ]; then
+            echo "Nothing new to log."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git commit -m "Log waiver processing time"
+          # Pick up any commits made while this run was waiting, then push.
+          git pull --rebase -q && git push
+
+      - name: Show processing-time stats
+        if: always() && steps.gate.outputs.go == 'true'
+        run: |
+          if [ -f data/waiver_log.csv ]; then
+            python3 analyze_waivers.py --markdown >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       # If anything above fails (bad name, ESPN error, timeout), ping your phone
-      # so you don't sit there assuming it's still watching.
+      # so you don't sit there assuming it's still watching. Nightly tracking
+      # runs send it as a silent, low-priority notification so it won't wake you,
+      # and a nightly run cancelled by your own manual run sends nothing.
       - name: Notify on failure
-        if: failure() || cancelled()
+        if: failure() || (cancelled() && github.event_name != 'schedule')
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PRIORITY: ${{ github.event_name == 'schedule' && 'low' || 'high' }}
         run: |
           if [ -n "$NTFY_TOPIC" ]; then
-            curl -s -H "Title: Waiver watch failed" -H "Priority: high" -H "Click: $RUN_URL" \
+            curl -s -H "Title: Waiver watch failed" -H "Priority: $PRIORITY" -H "Click: $RUN_URL" \
               -d "The waiver watch stopped with an error. Tap to see the log." \
               "https://ntfy.sh/$NTFY_TOPIC" > /dev/null
           fi
