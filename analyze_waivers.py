@@ -39,13 +39,11 @@ def clock(m):
     return f"{h % 12 or 12}:{mm:02d} {'AM' if h < 12 else 'PM'}"
 
 
-def load(path, tz, league=None):
+def load(path, tz):
     if not os.path.exists(path):
         sys.exit(f"No log found at {path} yet. It's created after the first watched night.")
     with open(path, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
-    if league:
-        rows = [r for r in rows if r["league_id"] == str(league)]
 
     # One result per night: if several runs watched the same night, keep the tightest.
     nights = {}
@@ -53,7 +51,7 @@ def load(path, tz, league=None):
         r["last"] = datetime.fromisoformat(r["last_waivers_utc"]).astimezone(tz)
         r["det"] = datetime.fromisoformat(r["detected_utc"]).astimezone(tz) if r["detected_utc"] else None
         r["width"] = (r["det"] - r["last"]).total_seconds() if r["det"] else None
-        key = (r["league_id"], r["night"])
+        key = r["night"]
         best = nights.get(key)
         if best is None or (r["det"] and (best["det"] is None or r["width"] < best["width"])):
             nights[key] = r
@@ -293,11 +291,10 @@ def main():
     ap = argparse.ArgumentParser(description="Analyze logged waiver processing times.")
     ap.add_argument("--log", default=os.getenv("WAIVER_LOG", DEFAULT_LOG))
     ap.add_argument("--tz", default=os.getenv("WAIVER_TZ", "America/New_York"))
-    ap.add_argument("--league", help="Only include this league ID")
     ap.add_argument("--markdown", action="store_true", help="Output markdown")
     args = ap.parse_args()
 
-    nights = load(args.log, ZoneInfo(args.tz), args.league)
+    nights = load(args.log, ZoneInfo(args.tz))
     print(report(analyze(nights), args.tz, md=args.markdown))
 
 

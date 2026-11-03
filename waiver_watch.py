@@ -98,13 +98,28 @@ def sleep_until(target):
         time.sleep(min(remaining, 60))
 
 
+# No league ID or anything account-specific: the log is committed to the repo.
 LOG_FIELDS = [
-    "night", "league_id", "player_id", "player_name", "outcome",
+    "night", "player_id", "player_name", "outcome",
     "last_waivers_utc", "detected_utc", "window_seconds", "processed_est_local",
 ]
 
 
-def record_result(path, league, player, name, outcome, last_waivers_at, detected_at, tz):
+def upgrade_log_format(path):
+    """Rewrite a log with an older column layout (e.g. one with league_id) into LOG_FIELDS."""
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames == LOG_FIELDS:
+            return
+        rows = list(reader)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=LOG_FIELDS, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
+    log("Updated the log file to the current format.")
+
+
+def record_result(path, player, name, outcome, last_waivers_at, detected_at, tz):
     """Append one night's result to the CSV log.
 
     The real processing moment is somewhere between the last poll that still showed
@@ -115,7 +130,6 @@ def record_result(path, league, player, name, outcome, last_waivers_at, detected
     est = last_waivers_at + (detected_at - last_waivers_at) / 2 if detected_at else None
     row = {
         "night": ref.astimezone(tz).date().isoformat(),
-        "league_id": league,
         "player_id": player,
         "player_name": name,
         "outcome": outcome,
@@ -127,6 +141,8 @@ def record_result(path, league, player, name, outcome, last_waivers_at, detected
     try:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         new_file = not os.path.exists(path) or os.path.getsize(path) == 0
+        if not new_file:
+            upgrade_log_format(path)
         with open(path, "a", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=LOG_FIELDS)
             if new_file:
@@ -150,12 +166,11 @@ def window_night(now, start_h, end_h):
     return start.date()
 
 
-def already_logged(path, league, night):
+def already_logged(path, night):
     if not path or not os.path.exists(path):
         return False
     with open(path, newline="", encoding="utf-8") as f:
-        return any(r.get("league_id") == str(league) and r.get("night") == night.isoformat()
-                   for r in csv.DictReader(f))
+        return any(r.get("night") == night.isoformat() for r in csv.DictReader(f))
 
 
 def pick_tracking_player(league, season, cookies, tz, night):
@@ -375,7 +390,7 @@ def main():
     log_path = None if args.no_log else args.log
     night = window_night(datetime.now(tz), start_h, end_h)
 
-    if args.skip_if_logged and already_logged(log_path, args.league, night):
+    if args.skip_if_logged and already_logged(log_path, night):
         log(f"{night:%a %b %d} is already logged. Nothing to do.")
         return
 
@@ -447,7 +462,7 @@ def main():
                 log(f"The {window_label} window ended and {name} is still on waivers.")
                 if args.one_window:
                     if log_path:
-                        record_result(log_path, args.league, args.player, name, "NOT_IN_WINDOW",
+                        record_result(log_path, args.player, name, "NOT_IN_WINDOW",
                                       last_waivers_at, None, tz)
                     notify("Waiver watch stopped",
                            f"The {window_label} window ended and {name} is still on waivers.", args.ntfy)
@@ -477,7 +492,7 @@ def main():
 
         # Waivers processed somewhere between the last WAIVERS poll and now.
         if log_path:
-            record_result(log_path, args.league, args.player, name, status,
+            record_result(log_path, args.player, name, status,
                           last_waivers_at, datetime.now(timezone.utc), tz)
 
         if status == "FREEAGENT":
