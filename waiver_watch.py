@@ -7,6 +7,7 @@ Usage:
     python3 waiver_watch.py --league 123456 --player 4277905
     python3 waiver_watch.py --league 123456 --player 4277905 --ntfy my-secret-topic
     python3 waiver_watch.py --name "jokic"      # search players on waivers by name
+    python3 waiver_watch.py --auto              # just log tonight's processing time
 
 Polling only happens between 3:00 and 5:00 AM Eastern, wherever your computer
 is. Started earlier, the script checks the player once, then waits for 3:00 AM
@@ -24,6 +25,7 @@ Requires: pip install requests
 """
 
 import argparse
+import csv
 import json
 import os
 import platform
@@ -32,12 +34,13 @@ import subprocess
 import sys
 import time
 import unicodedata
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import requests
 
 POLL_SECONDS = 30
+DEFAULT_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "waiver_log.csv")
 BACKOFF_SECONDS = 300  # wait this long after a 429 / 5xx before retrying
 
 
@@ -95,6 +98,96 @@ def sleep_until(target):
         time.sleep(min(remaining, 60))
 
 
+LOG_FIELDS = [
+    "night", "league_id", "player_id", "player_name", "outcome",
+    "last_waivers_utc", "detected_utc", "window_seconds", "processed_est_local",
+]
+
+
+def record_result(path, league, player, name, outcome, last_waivers_at, detected_at, tz):
+    """Append one night's result to the CSV log.
+
+    The real processing moment is somewhere between the last poll that still showed
+    WAIVERS and the first poll that didn't, so both ends are stored. The midpoint is
+    the best single estimate. NOT_IN_WINDOW rows mean the window ended with no change.
+    """
+    ref = detected_at or last_waivers_at
+    est = last_waivers_at + (detected_at - last_waivers_at) / 2 if detected_at else None
+    row = {
+        "night": ref.astimezone(tz).date().isoformat(),
+        "league_id": league,
+        "player_id": player,
+        "player_name": name,
+        "outcome": outcome,
+        "last_waivers_utc": last_waivers_at.isoformat(timespec="seconds"),
+        "detected_utc": detected_at.isoformat(timespec="seconds") if detected_at else "",
+        "window_seconds": round((detected_at - last_waivers_at).total_seconds()) if detected_at else "",
+        "processed_est_local": est.astimezone(tz).isoformat(timespec="seconds") if est else "",
+    }
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        new_file = not os.path.exists(path) or os.path.getsize(path) == 0
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=LOG_FIELDS)
+            if new_file:
+                w.writeheader()
+            w.writerow(row)
+        if est:
+            log(f"Logged: processed between {last_waivers_at.astimezone(tz):%I:%M:%S} and "
+                f"{detected_at.astimezone(tz):%I:%M:%S %p %Z}.")
+        else:
+            log("Logged: no processing during the window.")
+    except OSError as e:
+        log(f"(couldn't write log file {path}: {e})")
+
+
+def window_night(now, start_h, end_h):
+    """Calendar date (in now's time zone) of the window that's open now or opens next."""
+    if in_window(now, start_h, end_h):
+        start = next_window_start(now - timedelta(days=1), start_h)  # the one that opened
+    else:
+        start = next_window_start(now, start_h)
+    return start.date()
+
+
+def already_logged(path, league, night):
+    if not path or not os.path.exists(path):
+        return False
+    with open(path, newline="", encoding="utf-8") as f:
+        return any(r.get("league_id") == str(league) and r.get("night") == night.isoformat()
+                   for r in csv.DictReader(f))
+
+
+def pick_tracking_player(league, season, cookies, tz, night):
+    """For data collection: pick any player on waivers who's due to clear on `night`.
+
+    Every player due that night clears in the same processing run, so any one of
+    them shows when it happened. Returns a player ID, or None if nobody clears.
+    """
+    players = list_waiver_players(league, season, cookies)
+    if not players:
+        log("No players are on waivers in this league right now.")
+        return None
+
+    dated = [p for p in players if p.get("waiverProcessDate")]
+    if not dated:
+        # ESPN didn't say when they clear - watch one anyway (may log NOT_IN_WINDOW).
+        log(f"ESPN gave no clear dates; watching {full_name(players[0])} anyway.")
+        return players[0]["id"]
+
+    def clears(p):
+        return datetime.fromtimestamp(p["waiverProcessDate"] / 1000, tz)
+
+    tonight = [p for p in dated if clears(p).date() <= night]
+    if not tonight:
+        upcoming = ", ".join(f"{full_name(p)} ({clears(p):%a})" for p in sorted(dated, key=clears)[:5])
+        log(f"Nobody on waivers clears on {night:%a %b %d}. On waivers: {upcoming}")
+        return None
+    p = min(tonight, key=clears)
+    log(f"Tracking with {full_name(p)} (due to clear {clears(p):%a %I:%M %p %Z}).")
+    return p["id"]
+
+
 def log(msg):
     print(f"[{datetime.now():%H:%M:%S}] {msg}", flush=True)
 
@@ -130,8 +223,8 @@ def normalize(s):
     return "".join(c for c in s.lower() if c.isalnum() or c == " ").strip()
 
 
-def find_waiver_player_by_name(league, season, cookies, name):
-    """Search the players currently on waivers in this league by (partial) name."""
+def list_waiver_players(league, season, cookies):
+    """All players currently on waivers in this league."""
     # ESPN's API is undocumented, so try a few filter formats, from narrowest to broadest.
     sort = {"sortPercOwned": {"sortPriority": 1, "sortAsc": False}}
     attempts = [
@@ -155,16 +248,22 @@ def find_waiver_player_by_name(league, season, cookies, name):
                  + "\n".join(errors)
                  + "\nTry --player with the ID instead, and send me this output.")
 
-    waiver_players = [p for p in waiver_players if p.get("status") == "WAIVERS"]
+    return [p for p in waiver_players if p.get("status") == "WAIVERS"]
+
+
+def full_name(p):
+    return p.get("player", {}).get("fullName", str(p.get("id")))
+
+
+def find_waiver_player_by_name(league, season, cookies, name):
+    """Search the players currently on waivers in this league by (partial) name."""
+    waiver_players = list_waiver_players(league, season, cookies)
 
     query = normalize(name).split()
     matches = [
         p for p in waiver_players
         if all(word in normalize(p.get("player", {}).get("fullName", "")) for word in query)
     ]
-
-    def full_name(p):
-        return p.get("player", {}).get("fullName", str(p.get("id")))
 
     if len(matches) == 1:
         return matches[0]["id"]
@@ -241,6 +340,11 @@ def main():
     who = ap.add_mutually_exclusive_group(required=True)
     who.add_argument("--player", type=int, help="ESPN player ID currently on waivers")
     who.add_argument("--name", help='Player name, full or partial (e.g. "jokic"), searched among players on waivers')
+    who.add_argument("--auto", action="store_true",
+                     help="Data-collection mode: pick any player due to clear tonight, log the "
+                          "processing time, and send no phone push. Exits if nobody clears tonight.")
+    ap.add_argument("--skip-if-logged", action="store_true",
+                    help="Exit right away if tonight is already in the log")
     ap.add_argument("--season", type=int, default=2027, help="ESPN season year (2026-27 season = 2027)")
     ap.add_argument("--ntfy", default=os.getenv("NTFY_TOPIC"),
                     help="ntfy.sh topic for phone push notifications (defaults to NTFY_TOPIC in .env)")
@@ -253,11 +357,27 @@ def main():
                          "instead of waiting for the next night")
     ap.add_argument("--tz", default=os.getenv("WAIVER_TZ", "America/New_York"),
                     help="Time zone the window is in, regardless of where you are (default America/New_York)")
+    ap.add_argument("--log", default=os.getenv("WAIVER_LOG", DEFAULT_LOG),
+                    help=f"CSV file to record processing times in (default {DEFAULT_LOG})")
+    ap.add_argument("--no-log", action="store_true", help="Don't record this run")
     args = ap.parse_args()
     if isinstance(args.window, str):  # default value isn't run through type= by every Python version
         args.window = parse_window(args.window)
-    if args.no_ntfy:
+    if args.no_ntfy or args.auto:
         args.ntfy = None
+
+    try:
+        tz = ZoneInfo(args.tz)
+    except Exception:
+        sys.exit(f'Unknown time zone "{args.tz}". Use a name like America/New_York.\n'
+                 "(On Windows you may need: pip install tzdata)")
+    start_h, end_h = args.window
+    log_path = None if args.no_log else args.log
+    night = window_night(datetime.now(tz), start_h, end_h)
+
+    if args.skip_if_logged and already_logged(log_path, args.league, night):
+        log(f"{night:%a %b %d} is already logged. Nothing to do.")
+        return
 
     cookies = {}
     if os.getenv("ESPN_S2") and os.getenv("ESPN_SWID"):
@@ -272,6 +392,15 @@ def main():
         except requests.RequestException as e:
             sys.exit(f"Player search failed: {e}\n"
                      "If your league is private, set ESPN_S2 and ESPN_SWID.")
+    elif args.auto:
+        args.one_window = True  # data collection is per night; never roll over
+        try:
+            args.player = pick_tracking_player(args.league, args.season, cookies, tz, night)
+        except requests.RequestException as e:
+            sys.exit(f"Couldn't list players on waivers: {e}")
+        if args.player is None:
+            log("Nothing to track tonight.")
+            return
 
     # Initial check
     try:
@@ -289,20 +418,17 @@ def main():
     if clear_ms:
         log(f"{name} is on waivers, scheduled to clear {datetime.fromtimestamp(clear_ms / 1000):%a %b %d %I:%M %p}.")
 
-    try:
-        tz = ZoneInfo(args.tz)
-    except Exception:
-        sys.exit(f'Unknown time zone "{args.tz}". Use a name like America/New_York.\n'
-                 "(On Windows you may need: pip install tzdata)")
-
-    start_h, end_h = args.window
     window_label = f"{hour_label(start_h)}-{hour_label(end_h)} {datetime.now(tz):%Z}"
     if args.now:
         log(f"Polling every {POLL_SECONDS}s (ignoring the time window). Ctrl+C to stop.")
     else:
         log(f"Polling every {POLL_SECONDS}s during {window_label} only. Ctrl+C to stop.")
 
+    if log_path:
+        log(f"Results will be logged to {log_path}")
+
     last_check = time.time()  # the initial check above counts
+    last_waivers_at = datetime.now(timezone.utc)
     while True:
         if not args.now and not in_window(datetime.now(tz), start_h, end_h):
             start = next_window_start(datetime.now(tz), start_h)
@@ -320,6 +446,9 @@ def main():
             if not args.now and not in_window(datetime.now(tz), start_h, end_h):
                 log(f"The {window_label} window ended and {name} is still on waivers.")
                 if args.one_window:
+                    if log_path:
+                        record_result(log_path, args.league, args.player, name, "NOT_IN_WINDOW",
+                                      last_waivers_at, None, tz)
                     notify("Waiver watch stopped",
                            f"The {window_label} window ended and {name} is still on waivers.", args.ntfy)
                     return
@@ -342,8 +471,14 @@ def main():
 
         status = p.get("status")
         if status == "WAIVERS":
+            last_waivers_at = datetime.now(timezone.utc)
             log("Still on waivers.")
             continue
+
+        # Waivers processed somewhere between the last WAIVERS poll and now.
+        if log_path:
+            record_result(log_path, args.league, args.player, name, status,
+                          last_waivers_at, datetime.now(timezone.utc), tz)
 
         if status == "FREEAGENT":
             notify("Waivers processed", f"{name} is now a FREE AGENT - go grab him!", args.ntfy)
