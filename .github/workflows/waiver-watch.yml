@@ -35,14 +35,15 @@ on:
         type: boolean
         default: false
 
-  # GitHub schedules are in UTC and can start late (often 5-30 min, occasionally more).
-  # 06:41 and 07:41 UTC are 1:41/2:41 AM ET in winter and 2:41/3:41 AM ET in summer;
-  # the "Check the time" step only lets through the run that lands near 3 AM ET,
-  # so it works on both sides of daylight saving. The odd minute avoids the
-  # top-of-hour rush, when GitHub delays or drops scheduled runs most.
+  # GitHub schedules are in UTC and can start late. For this repo they have been
+  # starting about 8 hours late (observed Nov 2026), so the crons are set 7 hours
+  # earlier than the target: 23:41 and 00:41 UTC, which have been landing around
+  # 2:50 and 3:50 AM ET. The "Check the time" step only lets through a run that
+  # lands between 2:00 and 4:30 AM ET. The odd minute avoids the top-of-hour rush.
+  # If the delay changes, move these.
   schedule:
-    - cron: "41 6 * * *"
-    - cron: "41 7 * * *"
+    - cron: "41 23 * * *"
+    - cron: "41 0 * * *"
 
 # One watch at a time. A manual run cancels anything in progress (including a
 # nightly tracking run); a nightly run queues behind a manual one instead, then
