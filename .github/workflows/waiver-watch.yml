@@ -35,15 +35,15 @@ on:
         type: boolean
         default: false
 
-  # GitHub schedules are in UTC and can start late. For this repo they have been
-  # starting about 8 hours late (observed Nov 2026), so the crons are set 7 hours
-  # earlier than the target: 23:41 and 00:41 UTC, which have been landing around
-  # 2:50 and 3:50 AM ET. The "Check the time" step only lets through a run that
-  # lands between 2:00 and 4:30 AM ET. The odd minute avoids the top-of-hour rush.
-  # If the delay changes, move these.
+  # GitHub schedules are in UTC and can start hours late (3-8 h observed, Nov 2026),
+  # and the delay isn't steady. So instead of aiming at one time, this fires every
+  # 2 hours around the clock. The "Check the time" step lets through only a run that
+  # lands between 11:30 PM and 4:30 AM ET; that run waits for the 3 AM window
+  # (the repo is public, so waiting costs nothing). Runs landing at other times
+  # exit in seconds, and later in-window runs exit via --skip-if-logged.
+  # The odd minute avoids the top-of-hour rush.
   schedule:
-    - cron: "41 23 * * *"
-    - cron: "41 0 * * *"
+    - cron: "41 1-23/2 * * *"
 
 # One watch at a time. A manual run cancels anything in progress (including a
 # nightly tracking run); a nightly run queues behind a manual one instead, then
@@ -64,8 +64,10 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      # Nightly runs only: skip the duplicate run (see schedule above) without
-      # spending time on setup. Lets through anything from 2:00 to 4:30 AM ET.
+      # Nightly runs only: skip the runs that land at the wrong time (see schedule
+      # above) without spending time on setup. Lets through anything from 11:30 PM
+      # to 4:30 AM ET. 11:30 PM is the earliest start that still leaves the watch
+      # step enough of its 350 minutes to cover the whole 3-5 AM window.
       - name: Check the time
         id: gate
         run: |
@@ -74,7 +76,7 @@ jobs:
           fi
           now=$(TZ=America/New_York date +%H%M)
           echo "It's $now ET."
-          if (( 10#$now >= 200 && 10#$now < 430 )); then
+          if (( 10#$now >= 2330 || 10#$now < 430 )); then
             echo "go=true" >> "$GITHUB_OUTPUT"
           else
             echo "Not the right run for tonight - skipping."
