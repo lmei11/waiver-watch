@@ -34,6 +34,11 @@ on:
         required: false
         type: boolean
         default: false
+      auto:
+        description: "Nightly data collection: pick any player due tonight, no push (used by the external cron trigger; name and player are ignored)"
+        required: false
+        type: boolean
+        default: false
 
   # GitHub schedules are in UTC and can start hours late (3-8 h observed, Nov 2026),
   # and the delay isn't steady. So instead of aiming at one time, this fires every
@@ -50,7 +55,9 @@ on:
 # exits right away because the manual run already logged that night.
 concurrency:
   group: waiver-watch
-  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
+  # An auto dispatch (external cron) queues like a nightly run instead of cancelling
+  # a manual watch that's in progress.
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' && !inputs.auto }}
 
 # Lets the run commit the processing-time log (data/waiver_log.csv) back to the repo.
 permissions:
@@ -112,8 +119,9 @@ jobs:
           INPUT_NAME: ${{ inputs.name }}
           INPUT_PLAYER: ${{ inputs.player }}
           INPUT_NOW: ${{ inputs.now }}
+          INPUT_AUTO: ${{ inputs.auto }}
         run: |
-          if [ "$EVENT" = "schedule" ]; then
+          if [ "$EVENT" = "schedule" ] || [ "$INPUT_AUTO" = "true" ]; then
             python3 waiver_watch.py --auto --skip-if-logged
             exit
           fi
@@ -157,11 +165,11 @@ jobs:
       # runs send it as a silent, low-priority notification so it won't wake you,
       # and a nightly run cancelled by your own manual run sends nothing.
       - name: Notify on failure
-        if: failure() || (cancelled() && github.event_name != 'schedule')
+        if: failure() || (cancelled() && github.event_name != 'schedule' && !inputs.auto)
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          PRIORITY: ${{ github.event_name == 'schedule' && 'low' || 'high' }}
+          PRIORITY: ${{ (github.event_name == 'schedule' || inputs.auto) && 'low' || 'high' }}
         run: |
           if [ -n "$NTFY_TOPIC" ]; then
             curl -s -H "Title: Waiver watch failed" -H "Priority: $PRIORITY" -H "Click: $RUN_URL" \
