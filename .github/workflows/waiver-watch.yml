@@ -1,14 +1,17 @@
 # Put this file at .github/workflows/waiver-watch.yml in your repo.
 #
-# Two ways it runs:
+# Two ways it runs, both started by hand or by an external trigger
+# (workflow_dispatch). GitHub's own schedule isn't used because it starts runs
+# hours late and drops most of them.
 #
 # 1. Manually, when you want a specific player: Actions tab -> "Waiver watch" ->
 #    "Run workflow", enter a player name (or ID). It waits until 3:00 AM ET,
 #    polls every 30s until 5:00 AM ET, and pushes to your phone when he clears.
 #
-# 2. Automatically every night, just to collect processing times: it picks any
-#    player due to clear that night, logs when waivers ran to data/waiver_log.csv,
-#    and sends no phone push. If nobody clears that night, it exits in seconds.
+# 2. Every night from the external cron (cron-job.org, ~11:55 PM ET) with the
+#    "auto" input on, just to collect processing times: it picks any player due
+#    to clear that night, logs when waivers ran to data/waiver_log.csv, and sends
+#    no phone push. If nobody clears that night, it exits in seconds.
 #    To pause it: Actions tab -> "Waiver watch" -> "..." -> "Disable workflow".
 #
 # Repo secrets it uses (Settings -> Secrets and variables -> Actions):
@@ -40,24 +43,12 @@ on:
         type: boolean
         default: false
 
-  # GitHub schedules are in UTC and can start hours late (3-8 h observed, Nov 2026),
-  # and the delay isn't steady. So instead of aiming at one time, this fires every
-  # 2 hours around the clock. The "Check the time" step lets through only a run that
-  # lands between 11:30 PM and 4:30 AM ET; that run waits for the 3 AM window
-  # (the repo is public, so waiting costs nothing). Runs landing at other times
-  # exit in seconds, and later in-window runs exit via --skip-if-logged.
-  # The odd minute avoids the top-of-hour rush.
-  schedule:
-    - cron: "41 1-23/2 * * *"
-
-# One watch at a time. A manual run cancels anything in progress (including a
-# nightly tracking run); a nightly run queues behind a manual one instead, then
+# One watch at a time. A manual run cancels anything in progress (including an
+# auto tracking run); an auto run queues behind a manual one instead, then
 # exits right away because the manual run already logged that night.
 concurrency:
   group: waiver-watch
-  # An auto dispatch (external cron) queues like a nightly run instead of cancelling
-  # a manual watch that's in progress.
-  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' && !inputs.auto }}
+  cancel-in-progress: ${{ !inputs.auto }}
 
 # Lets the run commit the processing-time log (data/waiver_log.csv) back to the repo.
 permissions:
@@ -66,46 +57,23 @@ permissions:
 jobs:
   watch:
     runs-on: ubuntu-latest
-    # GitHub's hard limit is 6 hours (360 min). Start manual runs after ~11 PM ET
+    # GitHub's hard limit is 6 hours (360 min). Start runs after ~11 PM ET
     # so the whole 3-5 AM window fits.
     timeout-minutes: 360
 
     steps:
-      # Nightly runs only: skip the runs that land at the wrong time (see schedule
-      # above) without spending time on setup. Lets through anything from 11:30 PM
-      # to 4:30 AM ET. 11:30 PM is the earliest start that still leaves the watch
-      # step enough of its 350 minutes to cover the whole 3-5 AM window.
-      - name: Check the time
-        id: gate
-        run: |
-          if [ "${{ github.event_name }}" != "schedule" ]; then
-            echo "go=true" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          now=$(TZ=America/New_York date +%H%M)
-          echo "It's $now ET."
-          if (( 10#$now >= 2330 || 10#$now < 430 )); then
-            echo "go=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "Not the right run for tonight - skipping."
-            echo "go=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Get the code
-        if: steps.gate.outputs.go == 'true'
         uses: actions/checkout@v4
 
       - name: Set up Python
-        if: steps.gate.outputs.go == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Install dependencies
-        if: steps.gate.outputs.go == 'true'
         run: pip install -r requirements.txt
 
       - name: Watch waivers
-        if: steps.gate.outputs.go == 'true'
         # Stop a little before the job's 6-hour limit so the log still gets saved.
         timeout-minutes: 350
         env:
@@ -113,7 +81,6 @@ jobs:
           ESPN_S2: ${{ secrets.ESPN_S2 }}
           ESPN_SWID: ${{ secrets.ESPN_SWID }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          EVENT: ${{ github.event_name }}
           # Inputs go through env vars, not straight into the script line,
           # so odd characters in a name can't break the command.
           INPUT_NAME: ${{ inputs.name }}
@@ -121,7 +88,7 @@ jobs:
           INPUT_NOW: ${{ inputs.now }}
           INPUT_AUTO: ${{ inputs.auto }}
         run: |
-          if [ "$EVENT" = "schedule" ] || [ "$INPUT_AUTO" = "true" ]; then
+          if [ "$INPUT_AUTO" = "true" ]; then
             python3 waiver_watch.py --auto --skip-if-logged
             exit
           fi
@@ -140,7 +107,7 @@ jobs:
           python3 waiver_watch.py "${args[@]}"
 
       - name: Save processing-time log
-        if: always() && steps.gate.outputs.go == 'true'
+        if: always()
         run: |
           if [ -z "$(git status --porcelain data/)" ]; then
             echo "Nothing new to log."
@@ -154,22 +121,22 @@ jobs:
           git pull --rebase -q && git push
 
       - name: Show processing-time stats
-        if: always() && steps.gate.outputs.go == 'true'
+        if: always()
         run: |
           if [ -f data/waiver_log.csv ]; then
             python3 analyze_waivers.py --markdown >> "$GITHUB_STEP_SUMMARY"
           fi
 
       # If anything above fails (bad name, ESPN error, timeout), ping your phone
-      # so you don't sit there assuming it's still watching. Nightly tracking
-      # runs send it as a silent, low-priority notification so it won't wake you,
-      # and a nightly run cancelled by your own manual run sends nothing.
+      # so you don't sit there assuming it's still watching. Auto tracking runs
+      # send it as a silent, low-priority notification so it won't wake you,
+      # and an auto run cancelled by your own manual run sends nothing.
       - name: Notify on failure
-        if: failure() || (cancelled() && github.event_name != 'schedule' && !inputs.auto)
+        if: failure() || (cancelled() && !inputs.auto)
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          PRIORITY: ${{ (github.event_name == 'schedule' || inputs.auto) && 'low' || 'high' }}
+          PRIORITY: ${{ inputs.auto && 'low' || 'high' }}
         run: |
           if [ -n "$NTFY_TOPIC" ]; then
             curl -s -H "Title: Waiver watch failed" -H "Priority: $PRIORITY" -H "Click: $RUN_URL" \

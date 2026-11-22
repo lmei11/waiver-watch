@@ -1,0 +1,98 @@
+# Ranks today's best free-agent streamers: players on teams where someone is OUT
+# or day-to-day, with their stats scaled up for the minutes they'd absorb.
+#
+# Started by hand (Actions tab -> "Streamers" -> "Run workflow") or by an external
+# cron (cron-job.org -> POST to this workflow's dispatches API, e.g. at 2 PM ET and
+# again at 5 PM ET once more injury news is in). GitHub's own schedule isn't used
+# because it starts runs hours late. The ranking goes to the run summary and the
+# top few also go to your phone.
+#
+# Repo secrets it uses (same as Waiver watch):
+#   ESPN_LEAGUE_ID, ESPN_S2, ESPN_SWID, NTFY_TOPIC
+
+name: Streamers
+
+on:
+  workflow_dispatch:
+    inputs:
+      top:
+        description: "How many free agents to list"
+        required: false
+        type: string
+        default: "15"
+      push:
+        description: "Send the top N to your phone (0 = no push)"
+        required: false
+        type: string
+        default: "3"
+      weights:
+        description: 'Category multipliers, e.g. "3PM=3,FG%=0" (default 1 each)'
+        required: false
+        type: string
+      punt:
+        description: 'Categories to ignore, comma separated (e.g. "TO,FT%")'
+        required: false
+        type: string
+      date:
+        description: "Day to plan for, YYYY-MM-DD in ET (blank = today)"
+        required: false
+        type: string
+
+concurrency:
+  group: streamers
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  streamers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Rank streamers
+        env:
+          ESPN_LEAGUE_ID: ${{ secrets.ESPN_LEAGUE_ID }}
+          ESPN_S2: ${{ secrets.ESPN_S2 }}
+          ESPN_SWID: ${{ secrets.ESPN_SWID }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          # Inputs go through env vars, not straight into the script line,
+          # so odd characters can't break the command.
+          INPUT_TOP: ${{ inputs.top }}
+          INPUT_PUSH: ${{ inputs.push }}
+          INPUT_WEIGHTS: ${{ inputs.weights }}
+          INPUT_PUNT: ${{ inputs.punt }}
+          INPUT_DATE: ${{ inputs.date }}
+        run: |
+          args=(--top "${INPUT_TOP:-15}")
+          if [ -n "$INPUT_WEIGHTS" ]; then args+=(--weights "$INPUT_WEIGHTS"); fi
+          if [ -n "$INPUT_PUNT" ]; then args+=(--punt "$INPUT_PUNT"); fi
+          if [ -n "$INPUT_DATE" ]; then args+=(--date "$INPUT_DATE"); fi
+          # Plain text to the log (and the phone push), then the same ranking as a table.
+          python3 streamers.py "${args[@]}" --push "${INPUT_PUSH:-3}"
+          python3 streamers.py "${args[@]}" --markdown >> "$GITHUB_STEP_SUMMARY"
+
+      # If the ranking fails (ESPN error, bad date), ping your phone quietly.
+      - name: Notify on failure
+        if: failure()
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -n "$NTFY_TOPIC" ]; then
+            curl -s -H "Title: Streamers failed" -H "Priority: low" -H "Click: $RUN_URL" \
+              -d "The streamer ranking failed. Tap to see the log." \
+              "https://ntfy.sh/$NTFY_TOPIC" > /dev/null
+          fi
