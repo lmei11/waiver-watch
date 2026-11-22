@@ -25,6 +25,10 @@ on:
         required: false
         type: string
         default: "3"
+      vs:
+        description: 'Head to head of two players instead of the ranking, e.g. "hield,shamet"'
+        required: false
+        type: string
       weights:
         description: 'Category multipliers, e.g. "3PM=3,FG%=0" (default 1 each)'
         required: false
@@ -72,6 +76,7 @@ jobs:
           # so odd characters can't break the command.
           INPUT_TOP: ${{ inputs.top }}
           INPUT_PUSH: ${{ inputs.push }}
+          INPUT_VS: ${{ inputs.vs }}
           INPUT_WEIGHTS: ${{ inputs.weights }}
           INPUT_PUNT: ${{ inputs.punt }}
           INPUT_DATE: ${{ inputs.date }}
@@ -80,6 +85,12 @@ jobs:
           if [ -n "$INPUT_WEIGHTS" ]; then args+=(--weights "$INPUT_WEIGHTS"); fi
           if [ -n "$INPUT_PUNT" ]; then args+=(--punt "$INPUT_PUNT"); fi
           if [ -n "$INPUT_DATE" ]; then args+=(--date "$INPUT_DATE"); fi
+          if [ -n "$INPUT_VS" ]; then
+            # Head to head instead of the ranking: no phone push.
+            python3 streamers.py "${args[@]}" --vs "$INPUT_VS"
+            python3 streamers.py "${args[@]}" --vs "$INPUT_VS" --markdown >> "$GITHUB_STEP_SUMMARY"
+            exit
+          fi
           # Plain text to the log (and the phone push), then the same ranking as a table.
           python3 streamers.py "${args[@]}" --push "${INPUT_PUSH:-3}"
           python3 streamers.py "${args[@]}" --markdown >> "$GITHUB_STEP_SUMMARY"

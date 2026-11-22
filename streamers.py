@@ -12,6 +12,8 @@ Usage:
     python3 streamers.py --date 2026-11-23   # another day
     python3 streamers.py --top 25 --punt "TO,FT%"
     python3 streamers.py --weights "3PM=3,FG%=0"   # need threes, ignore FG%
+    python3 streamers.py --vs "hield,shamet"       # head to head, category by category
+    python3 streamers.py --no-spread               # skip game logs (no spread / win chances)
     python3 streamers.py --markdown          # table for a GitHub Actions summary
     python3 streamers.py --push 3            # ntfy the top 3 (needs NTFY_TOPIC)
 
@@ -30,14 +32,31 @@ How the numbers work (all the knobs are the constants below):
     players (percentages by their effect on the team's made shots, not raw %).
   - ESPN only reports ACTIVE / DAY_TO_DAY / OUT, so DAY_TO_DAY counts as DTD_P_OUT
     chance of sitting. Re-run later in the day once the news is firmer.
+  - Spread: the top of the list also pulls each player's last GAMELOG_GAMES games from
+    ESPN's public game log. His standard deviation of the weighted score (shrunk toward
+    the typical per-minute spread when he has few games, and stretched with his extra
+    minutes) gives a 10-90% range and the chance he beats the #1 pick head to head.
+  - "Best" is the chance he has the highest weighted score of the top CONTENDERS free
+    agents on the day (SIM_DRAWS simulated days, everyone's score drawn from his own
+    expected score and spread, day-to-day players scratched at their chance of sitting).
+    The list stays ranked by expected score; a high-variance player can have a higher
+    Best % than the favorite.
+  - --vs compares two players: his recent games rescaled to today's expected line (zeros
+    stay zeros, so blocks/steals still tie), then the chance A beats B in each category.
+    This is where upside shows up: a high-variance player can win a category more often
+    than his average suggests, or less.
 
 Requires: pip install requests
 """
 
 import argparse
+import math
 import os
+import random
+import statistics
 import sys
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -54,6 +73,19 @@ RECENT_WEIGHT = 0.6        # last-15-days weight in the baseline line
 MIN_RECENT_GP = 4          # games needed to trust the last-15-days line
 POOL_SIZE = 150            # most-owned players used for z-score scale
 PLAYER_LIMIT = 600         # players pulled from ESPN (most owned first)
+GAMELOG_GAMES = 20         # most recent games used for a player's spread
+PRIOR_GAMES = 5            # weight of the typical-spread prior vs the player's own games
+LOG_WORKERS = 6            # parallel game-log requests
+CONTENDERS = 30            # top free agents (by expected score) that compete in the best-of-the-day simulation
+SIM_DRAWS = 10000          # simulated days for the best-of-the-day chances
+Z80 = 1.2816               # z for the 10th / 90th percentile
+GAMELOG_URL = "https://site.web.api.espn.com/apis/common/v3/sports/basketball/nba/athletes/{}/gamelog"
+# Game log column name -> ESPN fantasy stat id (made-attempted columns split into two)
+LOG_COUNTS = {"minutes": "28", "totalRebounds": "6", "assists": "3", "blocks": "1",
+              "steals": "2", "turnovers": "11", "points": "0"}
+LOG_PAIRS = {"fieldGoalsMade-fieldGoalsAttempted": ("13", "14"),
+             "threePointFieldGoalsMade-threePointFieldGoalsAttempted": ("17", None),
+             "freeThrowsMade-freeThrowsAttempted": ("15", "16")}
 
 # ESPN stat id -> (label, kind). kind "count" = per-game total, "pct" = made/attempted.
 STAT_NAMES = {0: "PTS", 1: "BLK", 2: "STL", 3: "AST", 6: "REB", 11: "TO", 17: "3PM", 19: "FG%", 20: "FT%"}
@@ -253,15 +285,17 @@ class Scorer:
             self.mean[c] = mu
             self.std[c] = (sum((x - mu) ** 2 for x in xs) / len(xs)) ** 0.5 or 1.0
 
-    def z(self, line):
-        """Weighted z-score per category (weights apply to every player alike)."""
+    def z(self, line, weighted=True):
+        """z-score per category; weights apply to every player alike (weighted=False ignores them)."""
         v = cat_values(line, self.cats, self.lg_fg, self.lg_ft)
-        return {c: self.weights.get(c, 1.0) * (v[c] - self.mean[c]) / self.std[c] for c in self.cats}
+        return {c: (self.weights.get(c, 1.0) if weighted else 1.0) * (v[c] - self.mean[c]) / self.std[c]
+                for c in self.cats}
 
 
 # --- Main analysis -----------------------------------------------------------
-def analyze(profiles, games, cats, scorer, out_override=None):
-    """Score every free agent playing today. out_override: {player id: chance out} for what-ifs."""
+def analyze(profiles, games, cats, scorer, out_override=None, include=()):
+    """Score every free agent playing today. out_override: {player id: chance out} for what-ifs;
+    include: ids of non-free-agents to score as well (for head-to-head comparisons)."""
     by_team = defaultdict(list)
     for m in profiles:
         if m["team"] in games:
@@ -274,7 +308,7 @@ def analyze(profiles, games, cats, scorer, out_override=None):
             p_out.update({i: v for i, v in out_override.items() if i in p_out})
         boosts = team_boosts(roster, p_out)
         for m in roster:
-            if m["status"] != "FREEAGENT" or p_out[m["id"]] >= 1.0:
+            if (m["status"] != "FREEAGENT" and m["id"] not in include) or p_out[m["id"]] >= 1.0:
                 continue
             extra, causes = boosts.get(m["id"], (0.0, {}))
             base_z = scorer.z(m["line"])
@@ -286,6 +320,181 @@ def analyze(profiles, games, cats, scorer, out_override=None):
                             "score": score, "best": [STAT_NAMES[c] for c in best]})
     results.sort(key=lambda r: r["score"], reverse=True)
     return results
+
+
+# --- Game logs and spread ----------------------------------------------------
+def fetch_gamelog(pid, season):
+    """Per-game stat lines (newest first, up to GAMELOG_GAMES) from ESPN's public game log."""
+    r = requests.get(GAMELOG_URL.format(pid), headers=UA, timeout=20)
+    r.raise_for_status()
+    d = r.json()
+    names = d.get("names", [])
+    label = f"{season - 1}-{str(season)[-2:]} Regular Season"
+    rows = []
+    for st in d.get("seasonTypes", []):
+        if st.get("displayName") != label:
+            continue
+        for cat in st.get("categories", []):
+            for ev in cat.get("events", []):
+                line = {}
+                try:
+                    for name, val in zip(names, ev["stats"]):
+                        if name in LOG_COUNTS:
+                            line[LOG_COUNTS[name]] = float(val)
+                        elif name in LOG_PAIRS:
+                            made, _, att = val.partition("-")
+                            line[LOG_PAIRS[name][0]] = float(made)
+                            if LOG_PAIRS[name][1]:
+                                line[LOG_PAIRS[name][1]] = float(att)
+                except ValueError:
+                    continue  # non-numeric rows
+                if line.get(MINUTES, 0) >= 1:
+                    date = (d.get("events", {}).get(ev["eventId"]) or {}).get("gameDate", "")
+                    rows.append((date, line))
+    rows.sort(key=lambda row: row[0], reverse=True)
+    return [line for _, line in rows[:GAMELOG_GAMES]]
+
+
+def load_logs(ids, season):
+    """{player id: game lines}. A failed or empty fetch just leaves that player out."""
+    def one(pid):
+        try:
+            return pid, fetch_gamelog(pid, season)
+        except (requests.RequestException, ValueError, KeyError):
+            return pid, None
+    with ThreadPoolExecutor(max_workers=LOG_WORKERS) as ex:
+        return {pid: g for pid, g in ex.map(one, ids) if g}
+
+
+def phi(x):
+    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+
+def add_spread(results, logs, scorer):
+    """Attach sd (spread of today's weighted score), 10/90% bounds and p_top (chance of
+    beating the #1 pick head to head) to each result. results[0] must be the #1 pick.
+
+    A player's spread comes from his own recent games' weighted scores, pulled toward the
+    typical spread per minute played when he has few games (PRIOR_GAMES), then stretched by
+    the same factor as his extra minutes. Game-to-game luck is treated as independent.
+    """
+    stats = {}
+    for r in results:
+        g = logs.get(r["m"]["id"])
+        if g and len(g) >= 3:
+            stats[r["m"]["id"]] = (len(g), statistics.stdev([sum(scorer.z(x).values()) for x in g]))
+    rates = [sd / r["m"]["line"][MINUTES] for r in results for _, sd in [stats.get(r["m"]["id"], (0, 0))] if sd]
+    if not rates:
+        return
+    rate = statistics.median(rates)  # typical spread per minute: the prior for thin samples
+    for r in results:
+        mpg = r["m"]["line"][MINUTES]
+        n, sd = stats.get(r["m"]["id"], (0, 0.0))
+        sd = math.sqrt((n * sd ** 2 + PRIOR_GAMES * (rate * mpg) ** 2) / (n + PRIOR_GAMES))
+        r["n"], r["sd"] = n, sd * (1.0 + MINUTES_EFFICIENCY * r["extra"] / mpg)
+        r["lo"], r["hi"] = r["adj"] - Z80 * r["sd"], r["adj"] + Z80 * r["sd"]
+    top = results[0]
+    for r in results:
+        r["p_top"] = None if r is top else phi((r["adj"] - top["adj"]) / math.sqrt(r["sd"] ** 2 + top["sd"] ** 2))
+    for r, p in zip(results, simulate_best(results)):
+        r["p_best"] = p
+
+
+def simulate_best(results):
+    """Chance each player has the highest weighted score of the whole group on the day.
+
+    Simulates SIM_DRAWS days: everyone's score is drawn from a normal with his expected score
+    and spread (independently), and a day-to-day player is scratched with his chance of sitting.
+    Unlike beating the #1 pick head to head, this lets a high-variance player win on days when
+    the favorite has an ordinary game, and it counts the rest of the field too.
+    """
+    rng = random.Random(0)  # fixed seed: the same inputs always give the same percentages
+    wins = [0] * len(results)
+    for _ in range(SIM_DRAWS):
+        best, best_v = None, -math.inf
+        for i, r in enumerate(results):
+            if r["m"]["p_out"] and rng.random() < r["m"]["p_out"]:
+                continue
+            v = rng.gauss(r["adj"], r["sd"])
+            if v > best_v:
+                best, best_v = i, v
+        if best is not None:
+            wins[best] += 1
+    return [w / SIM_DRAWS for w in wins]
+
+
+def pairwise(a, b):
+    """Chance a random draw from a beats a random draw from b (ties count half)."""
+    return sum((x > y) + 0.5 * (x == y) for x in a for y in b) / (len(a) * len(b))
+
+
+def find_player(text, profiles):
+    q = normalize(text).split()
+    hits = [m for m in profiles if q and all(w in normalize(m["name"]) for w in q)]
+    exact = [m for m in hits if normalize(m["name"]) == normalize(text)]
+    if len(exact) == 1 or len(hits) == 1:
+        return (exact or hits)[0]
+    if not hits:
+        sys.exit(f'No player matches "{text}" (searched the {len(profiles)} most-owned players).')
+    sys.exit(f'"{text}" matches more than one player: ' + ", ".join(m["name"] for m in hits[:6]))
+
+
+def raw_text(line, c):
+    if c == 19:
+        return f"{line.get('13', 0) / (line.get('14') or 1):.0%} on {line.get('14', 0):.1f}"
+    if c == 20:
+        return f"{line.get('15', 0) / (line.get('16') or 1):.0%} on {line.get('16', 0):.1f}"
+    return f"{line.get(str(c), 0):.1f}"
+
+
+def versus(pair, profiles, games, cats, scorer, season, day, markdown):
+    """Head to head for two players on `day`: expected line and chance A beats B in each category."""
+    names = [t for t in pair.split(",") if t.strip()]
+    if len(names) != 2:
+        sys.exit('Use --vs "Player A,Player B".')
+    players = [find_player(t, profiles) for t in names]
+    scored = {r["m"]["id"]: r for r in analyze(profiles, games, cats, scorer, include={m["id"] for m in players})}
+    logs = load_logs([m["id"] for m in players], season)
+    sides = []
+    for m in players:
+        r = scored.get(m["id"])
+        if r is None:
+            sys.exit(f"{m['name']} has no game on {day:%a %b %d} or is ruled out.")
+        g = logs.get(m["id"], [])
+        if len(g) < 5:
+            sys.exit(f"Only {len(g)} games logged for {m['name']} this season; need at least 5 for a spread.")
+        sides.append({"m": m, "line": boosted_line(m, r["extra"]), "games": g})
+
+    def level(side):
+        """Per-game z-scores by category from his recent games, each stat rescaled so its average
+        matches today's expected line. Zeros stay zeros, so low-count stats like blocks still tie."""
+        recent, line = side["games"], side["line"]
+        zs = {}
+        for c in cats:
+            key = {19: "14", 20: "16"}.get(c, str(c))  # percentages scale with attempts
+            avg = sum(x.get(key, 0) for x in recent) / len(recent)
+            f = line.get(key, 0) / avg if avg > 0 else 1.0
+            zs[c] = [(cat_values(x, [c], scorer.lg_fg, scorer.lg_ft)[c] * f - scorer.mean[c]) / scorer.std[c]
+                     for x in recent]
+        total = [sum(scorer.weights.get(c, 1.0) * zs[c][i] for c in cats) for i in range(len(recent))]
+        return zs, total
+
+    a, b = sides
+    (za, ta), (zb, tb) = level(a), level(b)
+    rows = [(STAT_NAMES[c], raw_text(a["line"], c), raw_text(b["line"], c), pairwise(za[c], zb[c])) for c in cats]
+    total = pairwise(ta, tb)
+    an, bn = a["m"]["name"], b["m"]["name"]
+    out = [f"{an} vs {bn}, {day:%a %b %d} (expected game after minutes shifts; "
+           f"{len(a['games'])} and {len(b['games'])} games of spread)"]
+    if markdown:
+        out = [f"## {out[0]}", "", f"| Category | {an} | {bn} | P({an.split()[-1]} better) |", "|--|--|--|--|"]
+        out += [f"| {n} | {x} | {y} | {p:.0%} |" for n, x, y, p in rows]
+        out.append(f"| **Weighted total** | {statistics.fmean(ta):+.1f} | {statistics.fmean(tb):+.1f} | **{total:.0%}** |")
+    else:
+        out += [f"  {'':<14}{an[:18]:>18}{bn[:18]:>18}   P({an.split()[-1]} better)"]
+        out += [f"  {n:<14}{x:>18}{y:>18}   {p:.0%}" for n, x, y, p in rows]
+        out.append(f"  {'Weighted total':<14}{statistics.fmean(ta):>+18.1f}{statistics.fmean(tb):>+18.1f}   {total:.0%}")
+    return "\n".join(out)
 
 
 def pending_scenarios(profiles, games, cats, scorer, results, top_n=3, limit=6):
@@ -345,22 +554,31 @@ def render(results, scenarios, games, abbrev, day, top, markdown, weights):
     title = f"Streamers for {day:%a %b %d}"
     custom = ", ".join(f"{STAT_NAMES[c]} x{w:g}" for c, w in weights.items() if w != 1)
     note = f" Weights: {custom}." if custom else ""
+    spread = bool(results) and "sd" in results[0]
     if markdown:
         lines += [f"## {title}", "", f"{len(games) // 2} games. Ranked by expected value over your categories "
                   f"after shifting vacated minutes to teammates.{note}", "",
-                  "| # | Player | Game | Own% | +Min | Base | Adj | Helps | Why |", "|--|--|--|--|--|--|--|--|--|"]
+                  "| # | Player | Game | Own% | +Min | Base | Adj |" + (" 10-90% | Beats #1 | Best |" if spread else "")
+                  + " Helps | Why |", "|--|--|--|--|--|--|--|" + ("--|--|--|" if spread else "") + "--|--|"]
     else:
         lines += [title, f"{len(games) // 2} games, free agents only, ranked by adjusted value.{note}", ""]
     for i, r in enumerate(results[:top], 1):
         m = r["m"]
         name = f"{m['name']} ({POSITIONS.get(m['pos'], '?')}, {teams_by_id.get(m['team'], '?')}){flag(m)}"
+        rng = beats = best = ""
+        if spread and "sd" in r:
+            rng = f"[{r['lo']:+.1f}, {r['hi']:+.1f}]"
+            beats = "-" if r["p_top"] is None else f"{r['p_top']:.0%}"
+            best = f"{r['p_best']:.0%}"
         if markdown:
             lines.append(f"| {i} | {name} | {matchup(m, games)} | {m['own']:.0f} | {r['extra']:+.1f} | "
-                         f"{r['base']:+.1f} | {r['adj']:+.1f} | {', '.join(r['best'])} | {reason(r)} |")
+                         f"{r['base']:+.1f} | {r['adj']:+.1f} | " + (f"{rng} | {beats} | {best} | " if spread else "")
+                         + f"{', '.join(r['best'])} | {reason(r)} |")
         else:
             lines.append(f"{i:>2}. {name:<42} {matchup(m, games):<14} own {m['own']:>3.0f}%  "
                          f"{r['extra']:+.1f} min  base {r['base']:+.1f} -> {r['adj']:+.1f}  "
-                         f"[{', '.join(r['best'])}]  {reason(r)}")
+                         + (f"{rng} beats #1: {beats:>3}  best: {best:>3}  " if spread else "")
+                         + f"[{', '.join(r['best'])}]  {reason(r)}")
     if scenarios:
         lines += ["", "### Still undecided (day-to-day)" if markdown else "Still undecided (day-to-day):"]
         for m, gains in scenarios:
@@ -382,6 +600,8 @@ def main():
     ap.add_argument("--weights", default="",
                     help='Category multipliers, e.g. "3PM=3,FG%%=0" (default 1 each). Applied to every player.')
     ap.add_argument("--punt", default="", help='Shorthand for weight 0, e.g. "TO,FT%%"')
+    ap.add_argument("--vs", metavar="A,B", help='Head to head instead of a ranking, e.g. --vs "Hield,Shamet"')
+    ap.add_argument("--no-spread", action="store_true", help="Skip game logs (no spread or win chances; faster)")
     ap.add_argument("--markdown", action="store_true", help="Markdown output (for a GitHub Actions summary)")
     ap.add_argument("--push", type=int, default=0, metavar="N", help="Send the top N to your phone via ntfy")
     ap.add_argument("--ntfy", default=os.getenv("NTFY_TOPIC"), help="ntfy topic (defaults to NTFY_TOPIC)")
@@ -410,7 +630,13 @@ def main():
 
     pool = sorted(profiles, key=lambda m: m["own"], reverse=True)[:POOL_SIZE]
     scorer = Scorer(pool, cats, weights)
+    if args.vs:
+        log(versus(args.vs, profiles, games, cats, scorer, args.season, day, args.markdown))
+        return
     results = analyze(profiles, games, cats, scorer)
+    if results and not args.no_spread:
+        contenders = results[:max(args.top, CONTENDERS)]
+        add_spread(contenders, load_logs([r["m"]["id"] for r in contenders], args.season), scorer)
     scenarios = pending_scenarios(profiles, games, cats, scorer, results)
 
     text = render(results, scenarios, games, abbrev, day, args.top, args.markdown, weights)
@@ -418,7 +644,8 @@ def main():
 
     if args.push and args.ntfy and results:
         top = results[:args.push]
-        body = "\n".join(f"{r['m']['name']} ({abbrev.get(r['m']['team'], '?')}) {r['extra']:+.1f} min, {reason(r)}"
+        body = "\n".join(f"{r['m']['name']} ({abbrev.get(r['m']['team'], '?')}) {r['extra']:+.1f} min, "
+                         + (f"best {r['p_best']:.0%}, " if "p_best" in r else "") + reason(r)
                          for r in top)
         try:
             requests.post(f"https://ntfy.sh/{args.ntfy}", data=body.encode(), timeout=10,
